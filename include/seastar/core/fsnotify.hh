@@ -21,7 +21,11 @@
 
 #pragma once
 
+#ifdef __APPLE__
+#include <seastar/util/macos-compat.hh>
+#else
 #include <sys/inotify.h>
+#endif
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>

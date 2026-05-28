@@ -28,7 +28,9 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#ifndef __APPLE__
 #include <linux/perf_event.h>
+#endif
 #include <seastar/core/posix.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/scheduling.hh>
@@ -93,6 +95,17 @@ public:
     void end_sleep();
 };
 
+#ifdef __APPLE__
+// macOS has neither per-thread POSIX timers (timer_create) nor perf_event, so
+// the stall detector is a no-op there.
+class cpu_stall_detector_noop : public cpu_stall_detector {
+public:
+    explicit cpu_stall_detector_noop(cpu_stall_detector_config cfg = {}) : cpu_stall_detector(cfg) {}
+private:
+    virtual void arm_timer() override {}
+    virtual void start_sleep() override {}
+};
+#else
 class cpu_stall_detector_posix_timer : public cpu_stall_detector {
     timer_t _timer;
 public:
@@ -174,6 +187,7 @@ public:
     virtual void start_sleep() override;
     virtual bool is_spurious_signal() override;
 };
+#endif // __APPLE__
 
 std::unique_ptr<cpu_stall_detector> make_cpu_stall_detector(cpu_stall_detector_config cfg = {});
 

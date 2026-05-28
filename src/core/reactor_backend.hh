@@ -212,6 +212,14 @@ public:
     virtual future<> poll_rdhup(pollable_fd_state& fd) = 0;
     virtual void forget(pollable_fd_state& fd) noexcept = 0;
 
+    // Complete any pending readable()/writeable() futures for fd when its read
+    // and/or write side is being shut down, so a blocked accept()/recv()/send()
+    // can observe the shutdown and abort. The epoll/aio backends rely on the
+    // kernel surfacing the shutdown as a poll event, so the default is a no-op;
+    // the kqueue backend overrides this because macOS does not deliver a kqueue
+    // event for shutdown() of a listening socket (it fails with ENOTCONN).
+    virtual void shutdown(pollable_fd_state& fd, int how) {}
+
     virtual future<std::tuple<pollable_fd, socket_address>>
     accept(pollable_fd_state& listenfd) = 0;
     virtual future<> connect(pollable_fd_state& fd, socket_address& sa) = 0;
@@ -370,6 +378,63 @@ public:
 };
 
 class reactor_backend_uring;
+
+// reactor backend for macOS/BSD using kqueue. Waits on multiple file
+// descriptors via EVFILT_READ/EVFILT_WRITE, implements the high resolution
+// timer with EVFILT_TIMER, and inter-thread notifications via the reactor's
+// (emulated) eventfd. Preemption is driven by a dedicated timer thread, as in
+// the epoll backend, since macOS has no per-thread POSIX timers.
+class reactor_backend_kqueue : public reactor_backend {
+    reactor& _r;
+    file_desc _kqfd;
+    std::atomic<bool> _highres_timer_pending = {};
+    std::thread _task_quota_timer_thread;
+    std::atomic<bool> _dying{false};
+
+    void task_quota_timer_thread_fn();
+    bool wait_and_process(int timeout_ms, const sigset_t* active_sigmask);
+    bool complete_hrtimer();
+    future<> get_kqueue_future(pollable_fd_state& fd, int event);
+public:
+    explicit reactor_backend_kqueue(reactor& r);
+    virtual ~reactor_backend_kqueue() override;
+
+    virtual std::string_view get_backend_name() const override;
+    virtual bool reap_kernel_completions() override;
+    virtual bool kernel_submit_work() override;
+    virtual bool kernel_events_can_sleep() const override;
+    virtual void wait_and_process_events(const sigset_t* active_sigmask) override;
+    virtual future<> readable(pollable_fd_state& fd) override;
+    virtual future<> writeable(pollable_fd_state& fd) override;
+    virtual future<> readable_or_writeable(pollable_fd_state& fd) override;
+    virtual future<> poll_rdhup(pollable_fd_state& fd) override;
+    virtual void forget(pollable_fd_state& fd) noexcept override;
+    virtual void shutdown(pollable_fd_state& fd, int how) override;
+
+    virtual future<std::tuple<pollable_fd, socket_address>>
+    accept(pollable_fd_state& listenfd) override;
+    virtual future<> connect(pollable_fd_state& fd, socket_address& sa) override;
+    virtual future<size_t> read(pollable_fd_state& fd, void* buffer, size_t len) override;
+    virtual future<size_t> recvmsg(pollable_fd_state& fd, const std::vector<iovec>& iov) override;
+    virtual future<temporary_buffer<char>> read_some(pollable_fd_state& fd, internal::buffer_allocator* ba) override;
+    virtual future<size_t> sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_t len) override;
+    virtual future<size_t> writev(pollable_fd_state& fd, std::span<iovec> iovs) override;
+#if SEASTAR_API_LEVEL < 9
+    virtual future<size_t> send(pollable_fd_state& fd, const void* buffer, size_t len) override;
+#endif
+    virtual future<temporary_buffer<char>> recv_some(pollable_fd_state& fd, internal::buffer_allocator* ba) override;
+
+    virtual void signal_received(int signo, siginfo_t* siginfo, void* ignore) override;
+    virtual void start_tick() override;
+    virtual void stop_tick() override;
+    virtual void arm_highres_timer(const ::itimerspec& its) override;
+    virtual void reset_preemption_monitor() override;
+    virtual void request_preemption() override;
+    virtual void start_handling_signal() override;
+
+    virtual pollable_fd_state_ptr
+    make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) override;
+};
 
 class reactor_backend_selector {
     std::string _name;

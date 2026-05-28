@@ -22,7 +22,11 @@
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
+#ifdef __APPLE__
+#include <stdlib.h>
+#else
 #include <malloc.h>
+#endif
 #include <string.h>
 #include <fcntl.h>
 #include <filesystem>
@@ -447,7 +451,7 @@ private:
         if ((buf.size() & (_file.disk_write_dma_alignment() - 1)) != 0) {
             // If buf size isn't aligned, copy its content into a new aligned buf.
             // This should only happen when the user calls output_stream::flush().
-            auto tmp = allocate_buffer(align_up(buf.size(), _file.disk_write_dma_alignment()));
+            auto tmp = allocate_buffer(align_up<size_t>(buf.size(), _file.disk_write_dma_alignment()));
             ::memcpy(tmp.get_write(), buf.get(), buf.size());
             ::memset(tmp.get_write() + buf.size(), 0, tmp.size() - buf.size());
             buf = std::move(tmp);

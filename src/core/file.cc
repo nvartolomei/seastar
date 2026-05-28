@@ -43,12 +43,20 @@
 
 #include <sys/syscall.h>
 #include <dirent.h>
-#include <linux/types.h> // for xfs, below
-#include <linux/fs.h> // BLKBSZGET
-#include <linux/major.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <fcntl.h>
+#ifdef __APPLE__
+// macOS has neither the linux/* headers nor XFS; the block-device ioctl
+// constants and fallocate/fdatasync come from the compat shim, and the
+// XFS-specific code paths below are compiled out (no XFS on macOS).
+#include <seastar/util/macos-compat.hh>
+#include <sys/param.h>
+#include <sys/mount.h>   // struct statfs
+#else
+#include <linux/types.h> // for xfs, below
+#include <linux/fs.h> // BLKBSZGET
+#include <linux/major.h>
 #include <xfs/linux.h>
 /*
  * With package xfsprogs-devel >= 5.14.1, `fallthrough` has defined to
@@ -60,6 +68,7 @@
 #define min min    /* prevent xfs.h from defining min() as a macro */
 #include <xfs/xfs.h>
 #undef min
+#endif
 
 #include <seastar/core/align.hh>
 #include <seastar/core/internal/uname.hh>
@@ -466,7 +475,7 @@ posix_file_impl::close() noexcept {
 
 future<uint64_t>
 blockdev_file_impl::size() noexcept {
-    auto ret = co_await engine()._thread_pool->submit<syscall_result_extra<size_t>>(
+    auto ret = co_await engine()._thread_pool->submit<syscall_result_extra<uint64_t>>(
             internal::thread_pool_submit_reason::file_operation, [this] {
         uint64_t size;
         int ret = ::ioctl(_fd, BLKGETSIZE64, &size);
@@ -478,7 +487,15 @@ blockdev_file_impl::size() noexcept {
     co_return ret.extra;
 }
 
-static std::optional<directory_entry_type> dirent_type(const linux_dirent64& de) {
+#ifdef __APPLE__
+// macOS fills the directory buffer via getdirentries(2) with BSD struct dirent
+// records, which share the d_reclen/d_type/d_name fields the parser relies on.
+using dir_entry_t = struct ::dirent;
+#else
+using dir_entry_t = internal::linux_abi::linux_dirent64;
+#endif
+
+static std::optional<directory_entry_type> dirent_type(const dir_entry_t& de) {
     std::optional<directory_entry_type> type;
     switch (de.d_type) {
     case DT_BLK:
@@ -512,7 +529,15 @@ static std::optional<directory_entry_type> dirent_type(const linux_dirent64& de)
 future<size_t> posix_file_impl::read_directory(int fd, char* buffer, size_t buffer_size) {
     syscall_result<long> ret = co_await engine()._thread_pool->submit<syscall_result<long>>(
             internal::thread_pool_submit_reason::file_operation, [fd, buffer, buffer_size] () {
+#ifdef __APPLE__
+        // macOS has no getdents64.  The libc getdirentries() wrapper is poisoned
+        // under 64-bit inodes, so issue the getdirentries64 syscall directly; it
+        // fills the buffer with (modern) struct dirent records, parsed below.
+        off_t basep = 0;
+        long ret = ::syscall(SYS_getdirentries64, fd, buffer, buffer_size, &basep);
+#else
         auto ret = ::syscall(__NR_getdents64, fd, reinterpret_cast<linux_dirent64*>(buffer), buffer_size);
+#endif
         return wrap_syscall(ret);
     });
     if (ret.failed()) {
@@ -535,7 +560,7 @@ list_directory_generator_type make_list_directory_generator(int fd) {
         }
 
         for (const char* b = buf.get(); b < buf.get() + size; ) {
-            const auto de = reinterpret_cast<const linux_dirent64*>(b);
+            const auto de = reinterpret_cast<const dir_entry_t*>(b);
             b += de->d_reclen;
             sstring name(de->d_name);
             if (name == "." || name == "..") {
@@ -587,7 +612,7 @@ posix_file_impl::list_directory(std::function<future<> (directory_entry de)> nex
                 });
             }
             auto start = w->buffer + w->current;
-            auto de = reinterpret_cast<linux_dirent64*>(start);
+            auto de = reinterpret_cast<dir_entry_t*>(start);
             w->current += de->d_reclen;
             sstring name = de->d_name;
             if (name == "." || name == "..") {
@@ -1122,7 +1147,7 @@ append_challenged_posix_file_impl::truncate(uint64_t length) noexcept {
 
 future<uint64_t>
 append_challenged_posix_file_impl::size() noexcept {
-    return make_ready_future<size_t>(_logical_size);
+    return make_ready_future<uint64_t>(_logical_size);
 }
 
 std::unique_ptr<seastar::file_handle_impl>
@@ -1289,6 +1314,7 @@ internal::alignments filesystem_alignments(
     };
 
     // Override with filesystem-specific alignments if available
+#ifndef __APPLE__
     if (fs_type == internal::fs_magic::xfs) {
         dioattr da;
         if (::ioctl(fd, XFS_IOC_DIOINFO, &da) == 0) {
@@ -1301,6 +1327,7 @@ internal::alignments filesystem_alignments(
             align.disk_overwrite = xfs_with_relaxed_overwrite_alignment ? da.d_miniosz : align.disk_write;
         }
     }
+#endif
 
     // Common: apply physical_block_size override for all filesystems
     // This ensures we avoid hardware read-modify-write regardless of filesystem

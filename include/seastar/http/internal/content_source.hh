@@ -70,7 +70,7 @@ public:
     }
 
     virtual future<temporary_buffer<char>> skip(uint64_t n) override {
-        uint64_t skip_bytes = std::min(n, _remaining_bytes);
+        uint64_t skip_bytes = std::min<uint64_t>(n, _remaining_bytes);
         _remaining_bytes -= skip_bytes;
         return _inp.skip(skip_bytes).then([] {
             return temporary_buffer<char>();

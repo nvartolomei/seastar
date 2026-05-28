@@ -53,7 +53,11 @@
 // our dl_iterate_phdr we can effectively make libgcc callback thread safe.
 
 
+#ifdef __APPLE__
+#include <seastar/util/macos-compat.hh>
+#else
 #include <link.h>
+#endif
 #include <dlfcn.h>
 #include <vector>
 #include <cstddef>
@@ -64,6 +68,7 @@
 #include <seastar/util/assert.hh>
 
 namespace seastar {
+#ifndef __APPLE__
 using dl_iterate_fn = int (*) (int (*callback) (struct dl_phdr_info *info, size_t size, void *data), void *data);
 
 [[gnu::no_sanitize_address]]
@@ -116,6 +121,11 @@ void init_phdr_cache() {
         return 0;
     }, nullptr);
 }
+#else
+// macOS provides dl_iterate_phdr via dyld (see macos-compat.cc) and has no
+// glibc exception-scalability lock to work around, so phdr caching is a no-op.
+void init_phdr_cache() {}
+#endif // !__APPLE__
 
 void internal::increase_thrown_exceptions_counter() noexcept {
     seastar::engine()._cxx_exceptions++;
@@ -138,6 +148,7 @@ void log_exception_trace(seastar::log_level) noexcept {}
 
 }
 
+#ifndef __APPLE__
 extern "C"
 [[gnu::visibility("default")]]
 [[gnu::used]]
@@ -160,11 +171,14 @@ int dl_iterate_phdr(int (*callback) (struct dl_phdr_info *info, size_t size, voi
     }
     return r;
 }
+#endif // !__APPLE__
 
 // We disable interception of _Unwind_RaiseException when ASAN is enabled
 // since it can produce a large number of stack-related false positives when
 // it is enabled and exceptions are thrown.
-#if !defined(NO_EXCEPTION_INTERCEPT) && !defined(SEASTAR_ASAN_ENABLED)
+// macOS uses two-level namespaces; RTLD_NEXT interposition of the unwinder is
+// not reliable there, so exception interception is Linux-only.
+#if !defined(NO_EXCEPTION_INTERCEPT) && !defined(SEASTAR_ASAN_ENABLED) && !defined(__APPLE__)
 extern "C"
 [[gnu::visibility("default")]]
 [[gnu::used]]

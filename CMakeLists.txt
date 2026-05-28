@@ -421,7 +421,9 @@ seastar_find_dependencies ()
 find_package (ragel 6.10 REQUIRED)
 find_package (Threads REQUIRED)
 find_package (PthreadSetName REQUIRED)
-find_package (Valgrind REQUIRED)
+# Valgrind is not available on all platforms (e.g. Apple Silicon macOS). When
+# it is missing we stub out its client-request macros (see core/thread.cc).
+find_package (Valgrind)
 
 cmake_dependent_option (Seastar_LOGGER_COMPILE_TIME_FMT
   "Enable the compile-time {fmt} check when formatting logging messages" ON
@@ -464,7 +466,11 @@ function (seastar_generate_ragel)
     OUTPUT ${args_OUT_FILE}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${out_dir}
     COMMAND ${ragel_RAGEL_EXECUTABLE} -G2 -o ${args_OUT_FILE} ${args_IN_FILE}
-    COMMAND sed -i -e "'1h;2,$$H;$$!d;g'" -re "'s/static const char _nfa[^;]*;//g'" ${args_OUT_FILE}
+    # Strip the unused `static const char _nfa...;` arrays emitted by ragel.
+    # Use perl for an in-place, whole-file substitution that behaves
+    # identically with GNU and BSD userlands (macOS ships BSD sed, whose
+    # -i/-r flags are incompatible with the GNU spelling).
+    COMMAND perl -0777 -i -pe "'s/static const char _nfa[^;]*;//g'" ${args_OUT_FILE}
     COMMAND touch ${args_OUT_FILE} -r ${args_IN_FILE})
 
   add_custom_target (${args_TARGET}
@@ -732,7 +738,6 @@ add_library (seastar
   src/core/fstream.cc
   src/core/future.cc
   src/core/future-util.cc
-  src/core/linux-aio.cc
   src/core/memory.cc
   src/core/metrics.cc
   src/core/on_internal_error.cc
@@ -771,28 +776,17 @@ add_library (seastar
   src/http/retry_strategy.cc
   src/json/formatter.cc
   src/json/json_elements.cc
-  src/net/arp.cc
   src/net/config.cc
-  src/net/dhcp.cc
   src/net/dns.cc
   src/net/dpdk.cc
-  src/net/ethernet.cc
   src/net/inet_address.cc
-  src/net/ip.cc
-  src/net/ip_checksum.cc
-  src/net/native-stack-impl.hh
-  src/net/native-stack.cc
   src/net/net.cc
   src/net/packet.cc
   src/net/posix-stack.cc
-  src/net/proxy.cc
   src/net/socket_address.cc
   src/net/stack.cc
-  src/net/tcp.cc
   src/net/tls-impl.cc
-  src/net/udp.cc
   src/net/unix_address.cc
-  src/net/virtio.cc
   src/rpc/lz4_compressor.cc
   src/rpc/lz4_fragmented_compressor.cc
   src/rpc/rpc.cc
@@ -813,6 +807,39 @@ add_library (seastar
   src/websocket/client.cc
   src/websocket/server.cc
   )
+
+if (NOT APPLE)
+  # Linux-only sources: the linux-aio disk backend and the vhost/tun-tap virtio
+  # net driver.  (exception_hacks.cc is built everywhere; its glibc-specific
+  # interposition is #ifdef-gated internally.)
+  target_sources (seastar
+    PRIVATE
+      src/core/linux-aio.cc
+      src/net/virtio.cc)
+  # The native (userspace) TCP/IP stack is only usable with a userspace NIC
+  # driver (DPDK/virtio), neither of which is available on macOS; there the
+  # POSIX (kernel sockets) stack is always used.
+  target_sources (seastar
+    PRIVATE
+      src/net/arp.cc
+      src/net/dhcp.cc
+      src/net/ethernet.cc
+      src/net/ip.cc
+      src/net/ip_checksum.cc
+      src/net/native-stack.cc
+      src/net/proxy.cc
+      src/net/tcp.cc
+      src/net/udp.cc)
+endif ()
+
+if (APPLE)
+  # macOS compatibility shims: emulations/stubs for the Linux syscalls that
+  # Seastar's POSIX layer references (eventfd, accept4, pipe2, timerfd,
+  # dl_iterate_phdr via dyld, inotify, fallocate, ...).
+  target_sources (seastar
+    PRIVATE
+      src/core/macos-compat.cc)
+endif ()
 
 if (Seastar_GNUTLS)
   target_sources(seastar
@@ -864,12 +891,17 @@ target_include_directories (seastar
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 set (Seastar_PRIVATE_CXX_FLAGS
-  -fno-semantic-interposition
   -Wall
   -Werror
   -Wimplicit-fallthrough
   -Wdeprecated
   -Wno-error=deprecated)
+
+# -fno-semantic-interposition is an ELF concept; on Mach-O (Apple) it is
+# accepted but unused, which trips -Werror,-Wunused-command-line-argument.
+if (NOT APPLE)
+  list (APPEND Seastar_PRIVATE_CXX_FLAGS -fno-semantic-interposition)
+endif ()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   include (CheckGcc107852)
@@ -920,20 +952,28 @@ target_link_libraries (seastar
   PRIVATE
     ${CMAKE_DL_LIBS}
     StdAtomic::atomic
-    lksctp-tools::lksctp-tools
     protobuf::libprotobuf
-    rt::rt
     ucontext::ucontext
     yaml-cpp::yaml-cpp
     Threads::Threads)
-if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.26)
+# SCTP (lksctp-tools) and librt are Linux-only.
+if (NOT APPLE)
   target_link_libraries (seastar
     PRIVATE
-      "$<BUILD_LOCAL_INTERFACE:Valgrind::valgrind>")
-else ()
-  target_link_libraries (seastar
-    PRIVATE
-      "$<BUILD_INTERFACE:Valgrind::valgrind>")
+      lksctp-tools::lksctp-tools
+      rt::rt)
+endif ()
+if (Valgrind_FOUND)
+  list (APPEND Seastar_PRIVATE_COMPILE_DEFINITIONS SEASTAR_HAVE_VALGRIND)
+  if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.26)
+    target_link_libraries (seastar
+      PRIVATE
+        "$<BUILD_LOCAL_INTERFACE:Valgrind::valgrind>")
+  else ()
+    target_link_libraries (seastar
+      PRIVATE
+        "$<BUILD_INTERFACE:Valgrind::valgrind>")
+  endif ()
 endif ()
 
 if (Seastar_DPDK)
@@ -1013,12 +1053,16 @@ if (LinuxMembarrier_FOUND)
     PRIVATE LinuxMembarrier::membarrier)
 endif ()
 
-tri_state_option (${Seastar_ALLOC_FAILURE_INJECTION}
-  DEFAULT_BUILD_TYPES "Dev"
-  CONDITION condition)
-if (condition)
-  target_compile_definitions (seastar
-    PUBLIC $<${condition}:SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION>)
+# Allocation failure injection hooks into Seastar's custom allocator, which is
+# not built on macOS (it always uses the system allocator).
+if (NOT APPLE)
+  tri_state_option (${Seastar_ALLOC_FAILURE_INJECTION}
+    DEFAULT_BUILD_TYPES "Dev"
+    CONDITION condition)
+  if (condition)
+    target_compile_definitions (seastar
+      PUBLIC $<${condition}:SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION>)
+  endif ()
 endif ()
 
 if (Seastar_TASK_BACKTRACE)
@@ -1151,7 +1195,10 @@ if (Seastar_LD_FLAGS)
     PRIVATE ${Seastar_LD_FLAGS})
 endif ()
 
-if (SystemTap-SDT_FOUND)
+# The macOS SDK ships a <sys/sdt.h> for DTrace whose STAP_PROBE() macros are
+# incompatible with the SystemTap spelling Seastar uses, so disable SDT probes
+# there (they become no-ops).
+if (SystemTap-SDT_FOUND AND NOT APPLE)
   list (APPEND Seastar_PRIVATE_COMPILE_DEFINITIONS SEASTAR_HAVE_SYSTEMTAP_SDT)
 
   target_link_libraries (seastar
@@ -1184,6 +1231,21 @@ foreach (definition
       $<$<IN_LIST:$<CONFIG>,Debug;Sanitize;Fuzz>:${definition}>)
 endforeach ()
 
+if (APPLE)
+  # macOS always uses the system allocator: Seastar's custom allocator relies
+  # on Linux-specific mmap/hugepage behaviour and on overriding the global
+  # operator new/delete and the C malloc family, which is not supported here.
+  target_compile_definitions (seastar
+    PUBLIC SEASTAR_DEFAULT_ALLOCATOR)
+  # macOS gates the (deprecated) <ucontext.h> routines used by seastar::thread
+  # behind _XOPEN_SOURCE.  Pair it with _DARWIN_C_SOURCE so that requesting the
+  # X/Open API does not hide the Darwin extensions Seastar also relies on.
+  # __APPLE_USE_RFC_3542 exposes the advanced IPv6 socket options (IPV6_PKTINFO
+  # etc.) that the POSIX network stack uses.
+  target_compile_definitions (seastar
+    PUBLIC _XOPEN_SOURCE=700 _DARWIN_C_SOURCE __APPLE_USE_RFC_3542)
+endif ()
+
 tri_state_option (${Seastar_DEBUG_SHARED_PTR}
   DEFAULT_BUILD_TYPES "Debug" "Sanitize" "Fuzz"
   CONDITION condition)
@@ -1204,21 +1266,27 @@ endif ()
 
 include (CheckLibc)
 
-tri_state_option (${Seastar_STACK_GUARDS}
-  DEFAULT_BUILD_TYPES "Debug" "Sanitize" "Dev" "Fuzz"
-  CONDITION condition)
-if (condition)
-  # check for -fstack-clash-protection together with -Werror, because
-  # otherwise clang can soft-fail (return 0 but emit a warning) instead.
-  check_cxx_compiler_flag ("-fstack-clash-protection -Werror" StackClashProtection_FOUND)
-  if (StackClashProtection_FOUND)
-    target_compile_options (seastar
-      PUBLIC
-        $<${condition}:-fstack-clash-protection>)
+# The thread (fiber) stack guard page mprotects the low page of each
+# seastar::thread stack read-only.  On macOS this is incompatible with the
+# ucontext makecontext()/setcontext() implementation, which touches the low end
+# of the stack region and faults (SIGBUS), so stack guards are disabled there.
+if (NOT APPLE)
+  tri_state_option (${Seastar_STACK_GUARDS}
+    DEFAULT_BUILD_TYPES "Debug" "Sanitize" "Dev" "Fuzz"
+    CONDITION condition)
+  if (condition)
+    # check for -fstack-clash-protection together with -Werror, because
+    # otherwise clang can soft-fail (return 0 but emit a warning) instead.
+    check_cxx_compiler_flag ("-fstack-clash-protection -Werror" StackClashProtection_FOUND)
+    if (StackClashProtection_FOUND)
+      target_compile_options (seastar
+        PUBLIC
+          $<${condition}:-fstack-clash-protection>)
+    endif ()
+    target_compile_definitions (seastar
+      PRIVATE
+        $<${condition}:SEASTAR_THREAD_STACK_GUARDS>)
   endif ()
-  target_compile_definitions (seastar
-    PRIVATE
-      $<${condition}:SEASTAR_THREAD_STACK_GUARDS>)
 endif ()
 
 target_compile_definitions (seastar

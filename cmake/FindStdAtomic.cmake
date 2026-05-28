@@ -31,16 +31,22 @@ _stdatomic_can_link (StdAtomic_EXPLICIT_LINK)
 
 #
 # If linking against `-latomic` is successful, then do it unconditionally.
+# Otherwise (e.g. with libc++ on macOS, or toolchains where libgcc provides
+# the atomic intrinsics directly) std::atomic works without an explicit
+# library, so we report the package as found with no extra libraries to link.
 #
 
 if (StdAtomic_EXPLICIT_LINK)
   set (StdAtomic_LIBRARY_NAME atomic)
   set (StdAtomic_LIBRARIES -l${StdAtomic_LIBRARY_NAME})
-  include (FindPackageHandleStandardArgs)
-
-  find_package_handle_standard_args (StdAtomic
-    REQUIRED_VARS StdAtomic_LIBRARIES)
+else ()
+  set (StdAtomic_LIBRARIES "")
 endif ()
+
+set (StdAtomic_USABLE TRUE)
+include (FindPackageHandleStandardArgs)
+find_package_handle_standard_args (StdAtomic
+  REQUIRED_VARS StdAtomic_USABLE)
 
 if (NOT (TARGET StdAtomic::atomic))
   add_library (StdAtomic::atomic INTERFACE IMPORTED)

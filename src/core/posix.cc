@@ -28,7 +28,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#ifndef __APPLE__
 #include <sys/inotify.h>
+#endif
 
 #include <seastar/core/posix.hh>
 #include <seastar/core/align.hh>

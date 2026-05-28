@@ -28,13 +28,19 @@
 #include <coroutine>
 
 #include <unistd.h>
+#ifdef __APPLE__
+#include <seastar/util/macos-compat.hh>
+#include <net/if.h>
+#include <ifaddrs.h>
+#else
 #include <linux/if.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <netinet/sctp.h>
+#endif
 #include <arpa/inet.h>
 #include <net/route.h>
 #include <netinet/tcp.h>
-#include <netinet/sctp.h>
 #include <sys/socket.h>
 #include <seastar/util/assert.hh>
 
@@ -176,6 +182,8 @@ public:
     }
 };
 
+#ifndef __APPLE__
+// SCTP is Linux-only; macOS has no kernel SCTP support.
 class posix_sctp_connected_socket_operations : public posix_connected_socket_operations {
 public:
     virtual void set_nodelay(file_desc& _fd, bool nodelay) const override {
@@ -211,6 +219,7 @@ public:
         };
     }
 };
+#endif // !defined(__APPLE__)
 
 class posix_unix_stream_connected_socket_operations : public posix_connected_socket_operations {
 public:
@@ -233,14 +242,18 @@ public:
 static const posix_connected_socket_operations*
 get_posix_connected_socket_ops(sa_family_t family, int protocol) {
     static posix_tcp_connected_socket_operations tcp_ops;
+#ifndef __APPLE__
     static posix_sctp_connected_socket_operations sctp_ops;
+#endif
     static posix_unix_stream_connected_socket_operations unix_ops;
     switch (family) {
     case AF_INET:
     case AF_INET6:
         switch (protocol) {
         case IPPROTO_TCP: return &tcp_ops;
+#ifndef __APPLE__
         case IPPROTO_SCTP: return &sctp_ops;
+#endif
         default: abort();
         }
     case AF_UNIX:
@@ -1033,7 +1046,18 @@ private:
         file_desc fd = file_desc::socket(family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 
         if (is_inet(family)) {
+#ifdef __APPLE__
+            // macOS enables packet-info reception via IP_RECVPKTINFO /
+            // IPV6_RECVPKTINFO; IP_PKTINFO is a cmsg type here, not a settable
+            // boolean option (setting it fails with EINVAL).
+            if (family == AF_INET) {
+                fd.setsockopt(IPPROTO_IP, IP_RECVPKTINFO, 1);
+            } else {
+                fd.setsockopt(IPPROTO_IPV6, IPV6_RECVPKTINFO, 1);
+            }
+#else
             fd.setsockopt(SOL_IP, IP_PKTINFO, true);
+#endif
             if (engine().posix_reuseport_available()) {
                 fd.setsockopt(SOL_SOCKET, SO_REUSEPORT, 1);
             }
@@ -1244,6 +1268,12 @@ std::vector<network_interface> posix_network_stack::network_interfaces() {
     // For now, keep an immutable set of interfaces created on start, shared across
     // shards
     static const std::vector<posix_network_interface_impl> global_interfaces = [] {
+#ifdef __APPLE__
+        // Network-interface enumeration here uses netlink, which is Linux-only;
+        // macOS would use getifaddrs(3).  The POSIX socket path does not need
+        // it, so return an empty set for now.
+        return std::vector<posix_network_interface_impl>{};
+#else
         auto fd = ::socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
         throw_system_error_on(fd < 0, "could not open netlink socket");
 
@@ -1407,6 +1437,7 @@ std::vector<network_interface> posix_network_stack::network_interfaces() {
         }
 
         return res;
+#endif // !defined(__APPLE__)
     }();
 
     // And a similarly immutable set of shared_ptr to network_interface_impl per shard, ready

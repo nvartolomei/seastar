@@ -19,7 +19,11 @@
  * Copyright 2017 ScyllaDB
  */
 
+#ifdef __APPLE__
+#include <seastar/util/macos-compat.hh>
+#else
 #include <link.h>
+#endif
 #include <sys/types.h>
 #include <unistd.h>
 #include <algorithm>

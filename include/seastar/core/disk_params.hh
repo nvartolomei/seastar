@@ -62,7 +62,9 @@ public:
     {}
 
     uint64_t per_io_group(uint64_t qty, unsigned nr_groups) const noexcept {
-        return std::max(qty / nr_groups, 1ul);
+        // Explicit template argument: on macOS uint64_t and unsigned long are
+        // distinct types, so unqualified std::max() fails to deduce.
+        return std::max<uint64_t>(qty / nr_groups, 1);
     }
 
     unsigned num_io_groups() const noexcept { return _num_io_groups; }

@@ -25,7 +25,10 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <seastar/util/macos-compat.hh>
+#ifndef __APPLE__
 #include <linux/fs.h>
+#endif
 #include <type_traits>
 
 #include <seastar/util/bool_class.hh>

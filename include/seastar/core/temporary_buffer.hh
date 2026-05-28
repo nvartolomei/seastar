@@ -27,7 +27,11 @@
 #include <string_view>
 #include <vector>
 
+#ifdef __APPLE__
+#include <stdlib.h>     // malloc, free, posix_memalign
+#else
 #include <malloc.h>
+#endif
 
 #include <seastar/core/deleter.hh>
 #include <seastar/util/eclipse.hh>

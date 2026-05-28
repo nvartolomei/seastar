@@ -35,6 +35,7 @@
 #include <seastar/core/cacheline.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/assert.hh>
+#include <seastar/util/macos-compat.hh>
 
 namespace seastar {
 

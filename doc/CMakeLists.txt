@@ -1,6 +1,7 @@
 find_program (Seastar_DOXYGEN_EXECUTABLE doxygen)
 if (NOT Seastar_DOXYGEN_EXECUTABLE)
-  message (FATAL_ERROR "doxygen is required for building document!")
+  message (WARNING "doxygen not found; skipping documentation targets.")
+  return ()
 endif ()
 
 configure_file (

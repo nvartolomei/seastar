@@ -21,7 +21,9 @@
 
 #pragma once
 
+#ifndef __APPLE__
 #include <endian.h>
+#endif
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <cstdint>

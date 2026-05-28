@@ -84,7 +84,10 @@ public:
 
     /// How much should an allocation of size `allocation_size` count for
     size_t sample_size(size_t allocation_size) const {
-        return std::max(allocation_size, sampling_interval_);
+        // Use an explicit template argument: on macOS size_t (unsigned long)
+        // and uint64_t (unsigned long long) are distinct types, so unqualified
+        // std::max() fails template argument deduction.
+        return std::max<uint64_t>(allocation_size, sampling_interval_);
     }
 
     /// RAII class to temporarily pause sampling

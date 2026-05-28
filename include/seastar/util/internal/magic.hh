@@ -21,7 +21,11 @@
 
 #pragma once
 
+#ifndef __APPLE__
 #include <linux/magic.h>
+#endif
+// The filesystem magic numbers below are all provided as #ifndef fallbacks, so
+// macOS (which has no <linux/magic.h>) gets the same constants.
 
 namespace seastar {
 

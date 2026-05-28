@@ -26,7 +26,11 @@
 #include <utility>
 #include <fcntl.h>
 #include <signal.h>
+#ifdef __APPLE__
+#include <sys/event.h>
+#else
 #include <sys/epoll.h>
+#endif
 #include <poll.h>
 #include <sys/syscall.h>
 #include <sys/resource.h>
@@ -75,6 +79,9 @@ public:
     }
 };
 
+#ifndef __APPLE__
+// The linux-aio disk machinery and the aio/epoll reactor backends are
+// Linux-specific. macOS uses the kqueue backend defined further below.
 void prepare_iocb(const io_request& req, io_completion* desc, iocb& iocb) {
     switch (req.opcode()) {
     case io_request::operation::fdatasync:
@@ -1188,6 +1195,7 @@ reactor_backend_epoll::make_pollable_fd_state(file_desc fd, pollable_fd::specula
 void reactor_backend_epoll::reset_preemption_monitor() {
     _r._preemption_monitor.head.store(0, std::memory_order_relaxed);
 }
+#endif // !__APPLE__
 
 #ifdef SEASTAR_HAVE_URING
 
@@ -1972,6 +1980,435 @@ public:
 
 #endif
 
+#ifdef __APPLE__
+
+// ---------------------------------------------------------------------------
+// kqueue backend (macOS / BSD)
+// ---------------------------------------------------------------------------
+//
+// Mirrors reactor_backend_epoll, but waits on a kqueue. File descriptor
+// readiness uses EVFILT_READ/EVFILT_WRITE, the high resolution timer uses a
+// one-shot EVFILT_TIMER on the same kqueue (reaped whether the reactor is
+// sleeping or merely polling), and preemption is driven by a dedicated timer
+// thread that sleeps for the task quota (macOS has no per-thread POSIX timers
+// and no timerfd).  We reuse the EPOLL* bit values to track requested/armed
+// events in pollable_fd_state, translating to kqueue filters at the boundary.
+
+namespace {
+
+// kevent udata sentinels.
+void* const kqueue_notify_marker = nullptr;      // _r._notify_eventfd
+uintptr_t const kqueue_hrtimer_ident = 1;        // EVFILT_TIMER identifier
+
+class kqueue_pollable_fd_state : public pollable_fd_state {
+    pollable_fd_state_completion _pollin;
+    pollable_fd_state_completion _pollout;
+    pollable_fd_state_completion _pollrdhup;
+
+    pollable_fd_state_completion* get_desc(int events) {
+        if (events & EPOLLIN) {
+            return &_pollin;
+        }
+        if (events & EPOLLOUT) {
+            return &_pollout;
+        }
+        return &_pollrdhup;
+    }
+public:
+    explicit kqueue_pollable_fd_state(file_desc fd, speculation speculate)
+        : pollable_fd_state(std::move(fd), std::move(speculate))
+    {}
+    future<> get_completion_future(int event) {
+        auto desc = get_desc(event);
+        desc->reset();
+        return desc->get_future();
+    }
+    void complete_with(int event) {
+        get_desc(event)->complete_with(event);
+    }
+};
+
+void kq_complete(pollable_fd_state& pfd, int events, int event) {
+    if (pfd.events_requested & events & event) {
+        pfd.events_requested &= ~event;
+        pfd.events_known &= ~event;
+        static_cast<kqueue_pollable_fd_state&>(pfd).complete_with(event);
+    }
+}
+
+} // anonymous namespace
+
+reactor_backend_kqueue::reactor_backend_kqueue(reactor& r)
+        : reactor_backend(uses_blocking_io::no, supports_aio_fdatasync::no)
+        , _r(r)
+        , _kqfd(file_desc::from_fd(::kqueue())) {
+    throw_system_error_on(_kqfd.get() == -1, "kqueue");
+    // Register the cross-thread notification eventfd (level-triggered).
+    struct kevent kev;
+    EV_SET(&kev, _r._notify_eventfd.get(), EVFILT_READ, EV_ADD, 0, 0, kqueue_notify_marker);
+    auto ret = ::kevent(_kqfd.get(), &kev, 1, nullptr, 0, nullptr);
+    throw_system_error_on(ret == -1, "kevent (register notify eventfd)");
+}
+
+reactor_backend_kqueue::~reactor_backend_kqueue() = default;
+
+std::string_view reactor_backend_kqueue::get_backend_name() const {
+    return "kqueue";
+}
+
+void reactor_backend_kqueue::task_quota_timer_thread_fn() {
+    auto thread_name = seastar::format("timer-{}", _r._id);
+    pthread_setname_np(pthread_self(), thread_name.c_str());
+
+    sigset_t mask;
+    sigfillset(&mask);
+    for (auto sig : { SIGSEGV }) {
+        sigdelset(&mask, sig);
+    }
+    auto r = ::pthread_sigmask(SIG_BLOCK, &mask, NULL);
+    if (r) {
+        seastar_logger.error("Thread {}: failed to block signals. Aborting.", thread_name.c_str());
+        abort();
+    }
+
+    // macOS has no timerfd; sleep for the task quota and request preemption.
+    const auto quota = _r._cfg.task_quota;
+    while (!_dying.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(quota);
+        _r.request_preemption();
+        // We're on the same core as the reactor thread; a signal fence suffices.
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+}
+
+void reactor_backend_kqueue::start_tick() {
+    _task_quota_timer_thread = std::thread(&reactor_backend_kqueue::task_quota_timer_thread_fn, this);
+
+    ::sched_param sp;
+    sp.sched_priority = 1;
+    auto sched_ok = pthread_setschedparam(_task_quota_timer_thread.native_handle(), SCHED_FIFO, &sp);
+    if (sched_ok != 0 && _r._id == 0) {
+        seastar_logger.warn("Unable to set SCHED_FIFO scheduling policy for timer thread; latency impact possible.");
+    }
+}
+
+void reactor_backend_kqueue::stop_tick() {
+    _dying.store(true, std::memory_order_relaxed);
+    if (_task_quota_timer_thread.joinable()) {
+        _task_quota_timer_thread.join();
+    }
+}
+
+void reactor_backend_kqueue::arm_highres_timer(const ::itimerspec& its) {
+    struct kevent kev;
+    if (its.it_value.tv_sec == 0 && its.it_value.tv_nsec == 0) {
+        // Disarm.
+        EV_SET(&kev, kqueue_hrtimer_ident, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
+        ::kevent(_kqfd.get(), &kev, 1, nullptr, 0, nullptr);
+        return;
+    }
+    // its.it_value is an absolute deadline in the steady_clock_type epoch
+    // (std::chrono::steady_clock); convert to a relative delay using the SAME
+    // clock.  On macOS std::chrono::steady_clock does NOT share an epoch with
+    // clock_gettime(CLOCK_MONOTONIC), so using the latter here would be wrong.
+    int64_t deadline_ns = int64_t(its.it_value.tv_sec) * 1000000000 + its.it_value.tv_nsec;
+    int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t delay_ns = deadline_ns - now_ns;
+    if (delay_ns < 0) {
+        delay_ns = 0;
+    }
+    EV_SET(&kev, kqueue_hrtimer_ident, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, delay_ns, nullptr);
+    ::kevent(_kqfd.get(), &kev, 1, nullptr, 0, nullptr);
+}
+
+bool reactor_backend_kqueue::wait_and_process(int timeout_ms, const sigset_t* active_sigmask) {
+    std::array<struct kevent, 128> eevt;
+    struct timespec ts;
+    struct timespec* tsp = nullptr;
+    if (timeout_ms >= 0) {
+        ts.tv_sec = timeout_ms / 1000;
+        ts.tv_nsec = (timeout_ms % 1000) * 1000000L;
+        tsp = &ts;
+    }
+    // kqueue has no kevent variant that atomically swaps the signal mask, so
+    // emulate epoll_pwait by installing the mask around the (blocking) call.
+    sigset_t saved_mask;
+    bool restore_mask = false;
+    if (active_sigmask) {
+        ::pthread_sigmask(SIG_SETMASK, active_sigmask, &saved_mask);
+        restore_mask = true;
+    }
+    const auto before = sched_clock::now();
+    int nr = ::kevent(_kqfd.get(), nullptr, 0, eevt.data(), eevt.size(), tsp);
+    if (restore_mask) {
+        ::pthread_sigmask(SIG_SETMASK, &saved_mask, nullptr);
+    }
+    _r._total_sleep += sched_clock::now() - before;
+    if (nr == -1 && errno == EINTR) {
+        return false;
+    }
+    SEASTAR_ASSERT(nr != -1);
+    for (int i = 0; i < nr; ++i) {
+        auto& ev = eevt[i];
+        if (ev.filter == EVFILT_TIMER) {
+            _highres_timer_pending.store(true, std::memory_order_relaxed);
+            continue;
+        }
+        if (ev.udata == kqueue_notify_marker) {
+            char dummy[8];
+            _r._notify_eventfd.read(dummy, 8);
+            continue;
+        }
+        auto pfd = reinterpret_cast<pollable_fd_state*>(ev.udata);
+        int events = 0;
+        if (ev.filter == EVFILT_READ) {
+            events |= EPOLLIN;
+            if (ev.flags & EV_EOF) {
+                events |= EPOLLRDHUP;
+            }
+        }
+        if (ev.filter == EVFILT_WRITE) {
+            events |= EPOLLOUT;
+        }
+        if (ev.flags & EV_ERROR) {
+            // Treat as all requested events; let the I/O operation surface the error.
+            events |= pfd->events_requested;
+        }
+        kq_complete(*pfd, events, EPOLLRDHUP);
+        if (pfd->events_rw) {
+            kq_complete(*pfd, events, EPOLLIN | EPOLLOUT);
+        } else {
+            kq_complete(*pfd, events, EPOLLIN);
+            kq_complete(*pfd, events, EPOLLOUT);
+        }
+        // Re-sync kqueue filters with the events still requested.
+        bool want_r = pfd->events_requested & (EPOLLIN | EPOLLRDHUP);
+        bool want_w = pfd->events_requested & EPOLLOUT;
+        bool have_r = pfd->events_epoll & EPOLLIN;
+        bool have_w = pfd->events_epoll & EPOLLOUT;
+        struct kevent kev[2];
+        int n = 0;
+        if (!want_r && have_r) {
+            EV_SET(&kev[n++], pfd->fd.get(), EVFILT_READ, EV_DELETE, 0, 0, pfd);
+            pfd->events_epoll &= ~EPOLLIN;
+        }
+        if (!want_w && have_w) {
+            EV_SET(&kev[n++], pfd->fd.get(), EVFILT_WRITE, EV_DELETE, 0, 0, pfd);
+            pfd->events_epoll &= ~EPOLLOUT;
+        }
+        if (n) {
+            ::kevent(_kqfd.get(), kev, n, nullptr, 0, nullptr);
+        }
+    }
+    return nr;
+}
+
+bool reactor_backend_kqueue::complete_hrtimer() {
+    if (_highres_timer_pending.load(std::memory_order_relaxed)) {
+        _highres_timer_pending.store(false, std::memory_order_relaxed);
+        _r.service_highres_timer();
+        return true;
+    }
+    return false;
+}
+
+bool reactor_backend_kqueue::reap_kernel_completions() {
+    // No asynchronous disk I/O on macOS; nothing to reap here.
+    return false;
+}
+
+bool reactor_backend_kqueue::kernel_submit_work() {
+    bool result = false;
+    result |= wait_and_process(0, nullptr);
+    result |= complete_hrtimer();
+    return result;
+}
+
+bool reactor_backend_kqueue::kernel_events_can_sleep() const {
+    return true;
+}
+
+void reactor_backend_kqueue::wait_and_process_events(const sigset_t* active_sigmask) {
+    wait_and_process(-1, active_sigmask);
+    complete_hrtimer();
+}
+
+future<> reactor_backend_kqueue::get_kqueue_future(pollable_fd_state& pfd, int event) {
+    if (pfd.events_known & event) {
+        pfd.events_known &= ~event;
+        return make_ready_future();
+    }
+    pfd.events_rw = event == (EPOLLIN | EPOLLOUT);
+    pfd.events_requested |= event;
+
+    bool want_r = pfd.events_requested & (EPOLLIN | EPOLLRDHUP);
+    bool want_w = pfd.events_requested & EPOLLOUT;
+    bool have_r = pfd.events_epoll & EPOLLIN;
+    bool have_w = pfd.events_epoll & EPOLLOUT;
+    struct kevent kev[2];
+    int n = 0;
+    if (want_r && !have_r) {
+        EV_SET(&kev[n++], pfd.fd.get(), EVFILT_READ, EV_ADD, 0, 0, &pfd);
+        pfd.events_epoll |= EPOLLIN;
+    }
+    if (want_w && !have_w) {
+        EV_SET(&kev[n++], pfd.fd.get(), EVFILT_WRITE, EV_ADD, 0, 0, &pfd);
+        pfd.events_epoll |= EPOLLOUT;
+    }
+    if (n) {
+        int r = ::kevent(_kqfd.get(), kev, n, nullptr, 0, nullptr);
+        SEASTAR_ASSERT(r == 0);
+    }
+
+    auto* fd = static_cast<kqueue_pollable_fd_state*>(&pfd);
+    return fd->get_completion_future(event);
+}
+
+future<> reactor_backend_kqueue::readable(pollable_fd_state& fd) {
+    return get_kqueue_future(fd, EPOLLIN);
+}
+
+future<> reactor_backend_kqueue::writeable(pollable_fd_state& fd) {
+    return get_kqueue_future(fd, EPOLLOUT);
+}
+
+future<> reactor_backend_kqueue::readable_or_writeable(pollable_fd_state& fd) {
+    return get_kqueue_future(fd, EPOLLIN | EPOLLOUT);
+}
+
+future<> reactor_backend_kqueue::poll_rdhup(pollable_fd_state& fd) {
+    return get_kqueue_future(fd, EPOLLRDHUP);
+}
+
+void reactor_backend_kqueue::forget(pollable_fd_state& fd) noexcept {
+    if (fd.events_epoll) {
+        struct kevent kev[2];
+        int n = 0;
+        if (fd.events_epoll & EPOLLIN) {
+            EV_SET(&kev[n++], fd.fd.get(), EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+        }
+        if (fd.events_epoll & EPOLLOUT) {
+            EV_SET(&kev[n++], fd.fd.get(), EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+        }
+        if (n) {
+            ::kevent(_kqfd.get(), kev, n, nullptr, 0, nullptr);
+        }
+    }
+    auto* kfd = static_cast<kqueue_pollable_fd_state*>(&fd);
+    delete kfd;
+}
+
+void reactor_backend_kqueue::shutdown(pollable_fd_state& pfd, int how) {
+    // Determine which directions are being shut down.
+    int events = 0;
+    if (how == SHUT_RD || how == SHUT_RDWR) {
+        events |= EPOLLIN | EPOLLRDHUP;
+    }
+    if (how == SHUT_WR || how == SHUT_RDWR) {
+        events |= EPOLLOUT;
+    }
+    // Remove the affected kqueue filters and clear the armed bits first, so a
+    // later spurious event cannot double-complete the futures we resolve below.
+    struct kevent kev[2];
+    int n = 0;
+    if ((events & (EPOLLIN | EPOLLRDHUP)) && (pfd.events_epoll & EPOLLIN)) {
+        EV_SET(&kev[n++], pfd.fd.get(), EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+        pfd.events_epoll &= ~EPOLLIN;
+    }
+    if ((events & EPOLLOUT) && (pfd.events_epoll & EPOLLOUT)) {
+        EV_SET(&kev[n++], pfd.fd.get(), EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+        pfd.events_epoll &= ~EPOLLOUT;
+    }
+    if (n) {
+        ::kevent(_kqfd.get(), kev, n, nullptr, 0, nullptr);
+    }
+    // Complete any pending readable()/writeable() future for the shut
+    // directions. The awaiting accept()/recv()/send() then re-runs and observes
+    // the shutdown (e.g. via the pollable_fd shutdown_mask -> ECONNABORT).
+    kq_complete(pfd, events, EPOLLRDHUP);
+    if (pfd.events_rw) {
+        kq_complete(pfd, events, EPOLLIN | EPOLLOUT);
+    } else {
+        kq_complete(pfd, events, EPOLLIN);
+        kq_complete(pfd, events, EPOLLOUT);
+    }
+}
+
+future<std::tuple<pollable_fd, socket_address>>
+reactor_backend_kqueue::accept(pollable_fd_state& listenfd) {
+    return _r.do_accept(listenfd);
+}
+
+future<> reactor_backend_kqueue::connect(pollable_fd_state& fd, socket_address& sa) {
+    return _r.do_connect(fd, sa);
+}
+
+future<size_t>
+reactor_backend_kqueue::read(pollable_fd_state& fd, void* buffer, size_t len) {
+    return _r.do_read(fd, buffer, len);
+}
+
+future<size_t>
+reactor_backend_kqueue::recvmsg(pollable_fd_state& fd, const std::vector<iovec>& iov) {
+    return _r.do_recvmsg(fd, iov);
+}
+
+future<temporary_buffer<char>>
+reactor_backend_kqueue::read_some(pollable_fd_state& fd, internal::buffer_allocator* ba) {
+    return _r.do_read_some(fd, ba);
+}
+
+#if SEASTAR_API_LEVEL < 9
+future<size_t>
+reactor_backend_kqueue::send(pollable_fd_state& fd, const void* buffer, size_t len) {
+    return _r.do_send(fd, buffer, len);
+}
+#endif
+
+future<size_t>
+reactor_backend_kqueue::sendmsg(pollable_fd_state& fd, std::span<iovec> iovs, size_t len) {
+    return _r.do_sendmsg(fd, iovs, len);
+}
+
+future<size_t>
+reactor_backend_kqueue::writev(pollable_fd_state& fd, std::span<iovec> iovs) {
+    return _r.do_writev(fd, iovs);
+}
+
+future<temporary_buffer<char>>
+reactor_backend_kqueue::recv_some(pollable_fd_state& fd, internal::buffer_allocator* ba) {
+    return _r.do_recv_some(fd, ba);
+}
+
+void reactor_backend_kqueue::signal_received(int signo, siginfo_t* siginfo, void* ignore) {
+    if (engine_is_ready()) {
+        _r._signals.action(signo, siginfo, ignore);
+    } else {
+        reactor::signals::failed_to_handle(signo);
+    }
+}
+
+void reactor_backend_kqueue::request_preemption() {
+    _r._preemption_monitor.head.store(1, std::memory_order_relaxed);
+}
+
+void reactor_backend_kqueue::reset_preemption_monitor() {
+    _r._preemption_monitor.head.store(0, std::memory_order_relaxed);
+}
+
+void reactor_backend_kqueue::start_handling_signal() {
+    request_preemption();
+}
+
+pollable_fd_state_ptr
+reactor_backend_kqueue::make_pollable_fd_state(file_desc fd, pollable_fd::speculation speculate) {
+    return pollable_fd_state_ptr(new kqueue_pollable_fd_state(std::move(fd), std::move(speculate)));
+}
+
+#endif // __APPLE__
+
+#ifndef __APPLE__
 static bool detect_aio_poll() {
     auto fd = file_desc::eventfd(0, 0);
     aio_context_t ioc{};
@@ -2014,8 +2451,15 @@ bool reactor_backend_selector::has_enough_aio_nr() {
     }
     return true;
 }
+#endif // !__APPLE__
 
 std::unique_ptr<reactor_backend> reactor_backend_selector::create(reactor& r) {
+#ifdef __APPLE__
+    if (_name == "kqueue") {
+        return std::make_unique<reactor_backend_kqueue>(r);
+    }
+    throw std::logic_error("bad reactor backend");
+#else
     if (_name == "io_uring") {
 #ifdef SEASTAR_HAVE_URING
         return std::make_unique<reactor_backend_uring>(r);
@@ -2029,6 +2473,7 @@ std::unique_ptr<reactor_backend> reactor_backend_selector::create(reactor& r) {
         return std::make_unique<reactor_backend_epoll>(r);
     }
     throw std::logic_error("bad reactor backend");
+#endif
 }
 
 reactor_backend_selector reactor_backend_selector::default_backend() {
@@ -2037,6 +2482,9 @@ reactor_backend_selector reactor_backend_selector::default_backend() {
 
 std::vector<reactor_backend_selector> reactor_backend_selector::available() {
     std::vector<reactor_backend_selector> ret;
+#ifdef __APPLE__
+    ret.push_back(reactor_backend_selector("kqueue"));
+#else
 #ifdef SEASTAR_HAVE_URING
     if (detect_io_uring()) {
         ret.push_back(reactor_backend_selector("io_uring"));
@@ -2046,6 +2494,7 @@ std::vector<reactor_backend_selector> reactor_backend_selector::available() {
         ret.push_back(reactor_backend_selector("linux-aio"));
     }
     ret.push_back(reactor_backend_selector("epoll"));
+#endif
     return ret;
 }
 

@@ -36,17 +36,23 @@
 #include <grp.h>
 #include <spawn.h>
 #include <sys/syscall.h>
+#ifdef __APPLE__
+#include <seastar/util/macos-compat.hh>
+#include <sys/param.h>
+#include <sys/mount.h>   // struct statfs / fstatfs / statfs
+#else
 #include <sys/vfs.h>
 #include <sys/statfs.h>
+#include <sys/inotify.h>
+#include <sys/eventfd.h>
+#endif
 #include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
-#include <sys/inotify.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/eventfd.h>
 #include <poll.h>
 #include <netinet/in.h>
 #include <boost/lexical_cast.hpp>
@@ -65,9 +71,10 @@
 #include <boost/range/algorithm/find_if.hpp>
 #include <boost/algorithm/clamp.hpp>
 #include <boost/version.hpp>
+#include <sys/ioctl.h>
+#ifndef __APPLE__
 #define __user /* empty */  // for xfs includes, below
 #include <linux/types.h> // for xfs, below
-#include <sys/ioctl.h>
 #include <linux/perf_event.h>
 #include <xfs/linux.h>
 /*
@@ -80,6 +87,7 @@
 #define min min    /* prevent xfs.h from defining min() as a macro */
 #include <xfs/xfs.h>
 #undef min
+#endif // !__APPLE__
 #include <fmt/ostream.h>
 #include <fmt/ranges.h>
 
@@ -89,7 +97,9 @@
 
 #include <sys/mman.h>
 #include <sys/utsname.h>
+#ifndef __APPLE__
 #include <linux/falloc.h>
+#endif
 #ifdef SEASTAR_HAVE_SYSTEMTAP_SDT
 #include <sys/sdt.h>
 #else
@@ -940,6 +950,18 @@ static decltype(auto) install_signal_handler_stack() {
     throw_system_error_on(r == -1);
     return defer([mem = std::move(mem), prev_stack] () mutable noexcept {
         try {
+#ifdef __APPLE__
+            // macOS reports "no previous alternate stack" as {ss_sp=0,
+            // ss_size=0, SS_DISABLE} but then refuses to restore it because it
+            // validates ss_size >= MINSIGSTKSZ even when disabling (ENOMEM).
+            // Disable explicitly with a valid size/sp; once disabled the kernel
+            // never dereferences ss_sp, so reusing (soon-to-be-freed) mem is safe.
+            if (prev_stack.ss_size < size_t(MINSIGSTKSZ)) {
+                prev_stack.ss_flags = SS_DISABLE;
+                prev_stack.ss_size = size_t(MINSIGSTKSZ);
+                prev_stack.ss_sp = mem.get();
+            }
+#endif
             auto r = sigaltstack(&prev_stack, NULL);
             throw_system_error_on(r == -1);
         } catch (...) {
@@ -1120,7 +1142,14 @@ reactor::reactor(std::shared_ptr<seastar::smp> smp, alien::instance& alien, unsi
     , _alien(alien)
     , _cfg(std::move(cfg))
     , _notify_eventfd(file_desc::eventfd(0, EFD_CLOEXEC))
+#ifdef __APPLE__
+    // macOS has no timerfd; the kqueue backend's timer thread drives preemption
+    // by sleeping the task quota, so this descriptor is unused (kept valid as a
+    // placeholder).
+    , _task_quota_timer(file_desc::eventfd(0, EFD_CLOEXEC))
+#else
     , _task_quota_timer(file_desc::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC))
+#endif
     , _id(id)
     , _cpu_stall_detector(internal::make_cpu_stall_detector())
     , _cpu_sched(nullptr, 0)
@@ -1252,6 +1281,7 @@ cpu_stall_detector::cpu_stall_detector(cpu_stall_detector_config cfg)
     // note: if something is added here that can, it should take care to destroy _timer.
 }
 
+#ifndef __APPLE__
 cpu_stall_detector_posix_timer::cpu_stall_detector_posix_timer(cpu_stall_detector_config cfg) : cpu_stall_detector(cfg) {
     struct sigevent sev = {};
     sev.sigev_notify = SIGEV_THREAD_ID;
@@ -1269,6 +1299,7 @@ cpu_stall_detector_posix_timer::cpu_stall_detector_posix_timer(cpu_stall_detecto
 cpu_stall_detector_posix_timer::~cpu_stall_detector_posix_timer() {
     timer_delete(_timer);
 }
+#endif // !__APPLE__
 
 cpu_stall_detector_config
 cpu_stall_detector::get_config() const {
@@ -1336,10 +1367,12 @@ cpu_stall_detector::reset_suppression_state(sched_clock::time_point now) {
     _minute_mark = now;
 }
 
+#ifndef __APPLE__
 void cpu_stall_detector_posix_timer::arm_timer() {
     auto its = posix::to_relative_itimerspec(_threshold * _report_at + _slack, 0s);
     timer_settime(_timer, 0, &its, nullptr);
 }
+#endif // !__APPLE__
 
 void cpu_stall_detector::start_task_run(sched_clock::time_point now) {
     if (now > _rearm_timer_at) {
@@ -1358,15 +1391,18 @@ void cpu_stall_detector::end_task_run() {
     _last_tasks_processed_seen.store(0, std::memory_order_relaxed);
 }
 
+#ifndef __APPLE__
 void cpu_stall_detector_posix_timer::start_sleep() {
     auto its = posix::to_relative_itimerspec(0s,  0s);
     timer_settime(_timer, 0, &its, nullptr);
     _rearm_timer_at = reactor::now();
 }
+#endif // !__APPLE__
 
 void cpu_stall_detector::end_sleep() {
 }
 
+#ifndef __APPLE__
 static long
 perf_event_open(struct perf_event_attr* hw_event, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
@@ -1509,7 +1545,14 @@ cpu_stall_detector_linux_perf_event::try_make(cpu_stall_detector_config cfg) {
 }
 
 
+#endif // !__APPLE__
+
 std::unique_ptr<cpu_stall_detector> make_cpu_stall_detector(cpu_stall_detector_config cfg) {
+#ifdef __APPLE__
+    // macOS has no per-thread CPU timer or perf_event; stall detection is a
+    // no-op there.
+    return std::make_unique<cpu_stall_detector_noop>(cfg);
+#else
     bool was_eaccess_failure = false;
     try {
         try {
@@ -1532,6 +1575,7 @@ std::unique_ptr<cpu_stall_detector> make_cpu_stall_detector(cpu_stall_detector_c
         }
         return std::make_unique<cpu_stall_detector_posix_timer>(cfg);
     }
+#endif
 }
 
 void cpu_stall_detector::generate_trace() {
@@ -1736,6 +1780,11 @@ void pollable_fd_state::forget() {
 
 void pollable_fd_state::shutdown(int how) {
     fd.shutdown(how);
+    // Wake any pending readable()/writeable() so a blocked accept()/recv()/send()
+    // observes the shutdown. No-op on backends that rely on the kernel surfacing
+    // the shutdown as a poll event (epoll/aio); needed for kqueue on macOS, where
+    // shutdown() of a listening socket fails with ENOTCONN and fires no event.
+    engine()._backend->shutdown(*this, how);
 }
 
 void intrusive_ptr_release(pollable_fd_state* fd) {
@@ -1924,6 +1973,7 @@ reactor::open_file_dma(std::string_view nameref, open_flags flags, file_open_opt
                 return maybe_ret;
             }
         }
+#ifndef __APPLE__
         if (fd != -1 && options.extent_allocation_size_hint && !_cfg.kernel_page_cache) {
             fsxattr attr = {};
             int r = ::ioctl(fd, XFS_IOC_FSGETXATTR, &attr);
@@ -1944,6 +1994,7 @@ reactor::open_file_dma(std::string_view nameref, open_flags flags, file_open_opt
                 ::ioctl(fd, XFS_IOC_FSSETXATTR, &attr);
             }
         }
+#endif // !__APPLE__
         r = ::fstat(fd, &st);
         if (r == -1) {
             return wrap_syscall(r, st);
@@ -1978,8 +2029,18 @@ reactor::rename_file(std::string_view old_pathname_view, std::string_view new_pa
     auto raw_flags = std::underlying_type_t<rename_flags>(flags);
     syscall_result<int> sr = co_await _thread_pool->submit<syscall_result<int>>(
             internal::thread_pool_submit_reason::file_operation, [old_pathname, new_pathname, raw_flags] {
+#ifdef __APPLE__
+        // macOS has renameatx_np with a different flag set (RENAME_SWAP/EXCL);
+        // only the plain, flag-less rename is supported here.
+        if (raw_flags != 0) {
+            errno = ENOTSUP;
+            return wrap_syscall<int>(-1);
+        }
+        return wrap_syscall<int>(::rename(old_pathname.c_str(), new_pathname.c_str()));
+#else
         return wrap_syscall<int>(static_cast<int>(
                 ::syscall(SYS_renameat2, AT_FDCWD, old_pathname.c_str(), AT_FDCWD, new_pathname.c_str(), raw_flags)));
+#endif
     });
     if (sr.failed()) {
         co_await coroutine::return_exception_ptr(
@@ -3041,11 +3102,24 @@ public:
         // systemwide_memory_barrier() is very slow if run concurrently,
         // so don't go to sleep if it is running now.
         _r._sleeping.store(true, std::memory_order_relaxed);
+#ifdef __APPLE__
+        // macOS has no membarrier, and the mprotect barrier trick is unreliable
+        // on aarch64, so try_systemwide_memory_barrier() always fails there,
+        // which would keep the reactor busy-polling (100% CPU) forever. Instead
+        // use a symmetric seq_cst fence, paired with one in reactor::wakeup():
+        // the store-then-fence-then-load (Dekker) pattern guarantees a shard
+        // going to sleep and a shard submitting cross-shard work cannot miss
+        // each other. This is slightly more costly on the submit fast path than
+        // the asymmetric membarrier scheme, but it is correct and lets the
+        // reactor actually sleep when idle.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+#else
         bool barrier_done = internal::try_systemwide_memory_barrier();
         if (!barrier_done) {
             _r._sleeping.store(false, std::memory_order_relaxed);
             return false;
         }
+#endif
         if (poll()) {
             // raced
             _r._sleeping.store(false, std::memory_order_relaxed);
@@ -3103,6 +3177,13 @@ public:
 
 void
 reactor::wakeup() {
+#ifdef __APPLE__
+    // Pair with the seq_cst fence in smp_pollfn::try_enter_interrupt_mode():
+    // the caller has already enqueued the work this wakeup is for, and this
+    // fence orders that against the _sleeping load below so we never skip a
+    // needed wakeup of a shard that is concurrently deciding to sleep.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
     if (!_sleeping.load(std::memory_order_relaxed)) {
         return;
     }
@@ -3413,8 +3494,12 @@ int reactor::do_run() {
     _load_timer.arm_periodic(1s);
 
     itimerspec its = seastar::posix::to_relative_itimerspec(_cfg.task_quota, _cfg.task_quota);
+#ifndef __APPLE__
+    // On macOS the kqueue backend's timer thread drives preemption directly; the
+    // _task_quota_timer descriptor is not a timerfd there.
     _task_quota_timer.timerfd_settime(0, its);
-    auto& task_quote_itimerspec = its;
+#endif
+    [[maybe_unused]] auto& task_quote_itimerspec = its;
 
     struct sigaction sa_block_notifier = {};
     sa_block_notifier.sa_handler = &reactor::block_notifier;
@@ -3465,9 +3550,11 @@ int reactor::do_run() {
                 internal::cpu_relax();
                 if (idle_end - idle_start > _cfg.max_poll_time) {
                     if (pollers_enter_interrupt_mode()) {
+#ifndef __APPLE__
                         // Turn off the task quota timer to avoid spurious wakeups
                         struct itimerspec zero_itimerspec = {};
                         _task_quota_timer.timerfd_settime(0, zero_itimerspec);
+#endif
                         _cpu_stall_detector->start_sleep();
 
                         wait_and_process_events();
@@ -3476,7 +3563,9 @@ int reactor::do_run() {
                         _cpu_stall_detector->end_sleep();
                         // We may have slept for a while, so freshen idle_end
                         idle_end = now();
+#ifndef __APPLE__
                         _task_quota_timer.timerfd_settime(0, task_quote_itimerspec);
+#endif
                     }
                 }
             } else {
@@ -3995,7 +4084,12 @@ static program_options::selection_value<network_stack_factory> create_network_st
     auto deleter = [] (network_stack_factory* p) { delete p; };
 
     std::string default_stack;
-    for (auto reg_func : {register_native_stack, register_posix_stack}) {
+    for (auto reg_func : {
+#ifndef __APPLE__
+            // The native (userspace) network stack is not built on macOS.
+            register_native_stack,
+#endif
+            register_posix_stack}) {
         auto s = reg_func();
         if (s.is_default) {
             default_stack = s.name;
@@ -4247,7 +4341,11 @@ static void sigsegv_action(siginfo_t *info, ucontext_t* uc) noexcept {
         print_safe(", si_pid: ");
         // print the pid in the case the signal was sent by someone else
         print_decimal_safe(static_cast<unsigned>(info->si_pid));
-    } else if (code == SEGV_MAPERR || code == SEGV_ACCERR || code == SEGV_BNDERR) {
+    } else if (code == SEGV_MAPERR || code == SEGV_ACCERR
+#ifdef SEGV_BNDERR
+               || code == SEGV_BNDERR
+#endif
+              ) {
         // print the address of the data access
         print_safe(", si_addr: ");
         print_zero_padded_hex_safe(reinterpret_cast<uintptr_t>(info->si_addr));
@@ -4256,7 +4354,10 @@ static void sigsegv_action(siginfo_t *info, ucontext_t* uc) noexcept {
 
     uintptr_t ip;
     if (uc) {
-#if defined(__x86_64__)
+#if defined(__APPLE__) && defined(__aarch64__)
+        // macOS: uc_mcontext is a pointer and the PC lives in __ss.__pc.
+        ip = uc->uc_mcontext->__ss.__pc;
+#elif defined(__x86_64__)
         ip = uc->uc_mcontext.gregs[REG_RIP];
 #elif defined(__aarch64__)
         ip = uc->uc_mcontext.pc;

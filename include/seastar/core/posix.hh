@@ -21,13 +21,16 @@
 
 #pragma once
 
+#include <seastar/util/macos-compat.hh>
+#ifndef __APPLE__
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
+#endif
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <assert.h>
@@ -117,9 +120,25 @@ public:
         return file_desc(fd);
     }
     static file_desc socket(int family, int type, int protocol = 0) {
+#ifdef __APPLE__
+        // macOS socket() does not accept the Linux SOCK_NONBLOCK/SOCK_CLOEXEC
+        // type flags; strip them and apply via fcntl after creation.
+        int extra = type & (SOCK_NONBLOCK | SOCK_CLOEXEC);
+        int fd = ::socket(family, type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC), protocol);
+        throw_system_error_on(fd == -1, "socket");
+        if (extra & SOCK_NONBLOCK) {
+            int fl = ::fcntl(fd, F_GETFL, 0);
+            ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        }
+        if (extra & SOCK_CLOEXEC) {
+            ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+        }
+        return file_desc(fd);
+#else
         int fd = ::socket(family, type, protocol);
         throw_system_error_on(fd == -1, "socket");
         return file_desc(fd);
+#endif
     }
     static file_desc eventfd(unsigned initval, int flags) {
         int fd = ::eventfd(initval, flags);

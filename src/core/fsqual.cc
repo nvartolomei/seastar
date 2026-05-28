@@ -61,6 +61,12 @@ with_ctxsw_counting(Counter& counter, Func&& func) {
 }
 
 bool filesystem_has_good_aio_support(sstring directory, bool verbose) {
+#ifdef __APPLE__
+    // macOS has no Linux AIO; disk I/O always goes through the syscall thread.
+    (void)directory;
+    (void)verbose;
+    return false;
+#else
     aio_context_t ioctx = {};
     auto r = io_setup(1, &ioctx);
     throw_system_error_on(r == -1, "io_setup");
@@ -101,6 +107,7 @@ bool filesystem_has_good_aio_support(sstring directory, bool verbose) {
                   << " (" << verdict << ")\n";
     }
     return ok;
+#endif // __APPLE__
 }
 
 }

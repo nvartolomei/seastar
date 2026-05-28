@@ -37,7 +37,9 @@
 #include <sys/statvfs.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
+#ifndef __APPLE__
 #include <linux/fs.h>
+#endif
 #include <sys/uio.h>
 #include <unistd.h>
 #include <chrono>

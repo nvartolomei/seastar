@@ -69,7 +69,10 @@
 #include <unordered_map>
 #include <vector>
 #include <unistd.h>
+#include <seastar/util/macos-compat.hh>
+#ifndef __APPLE__
 #include <sys/epoll.h>
+#endif
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
@@ -175,6 +178,7 @@ private:
     friend class reactor_backend_epoll;
     friend class reactor_backend_aio;
     friend class reactor_backend_uring;
+    friend class reactor_backend_kqueue;
     friend class reactor_backend_selector;
     friend struct reactor_options;
     friend class aio_storage_context;

@@ -30,7 +30,15 @@
 #include <setjmp.h>
 #endif
 #include <stdint.h>
+#ifdef SEASTAR_HAVE_VALGRIND
 #include <valgrind/valgrind.h>
+#else
+// Valgrind is not available on this platform (e.g. Apple Silicon macOS).
+// Its client-request macros are no-ops outside of valgrind anyway, so stub
+// the two we use for registering coroutine/thread stacks.
+#define VALGRIND_STACK_REGISTER(start, end) (0)
+#define VALGRIND_STACK_DEREGISTER(id) ((void)(id))
+#endif
 #include <exception>
 #include <utility>
 #include <boost/intrusive/list.hpp>

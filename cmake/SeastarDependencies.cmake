@@ -100,8 +100,13 @@ macro (seastar_find_dependencies)
   if (Seastar_HWLOC)
     seastar_find_dep (hwloc 1.11.2 REQUIRED)
   endif()
-  seastar_find_dep (lksctp-tools REQUIRED)
-  seastar_find_dep (rt REQUIRED)
+  # SCTP (lksctp-tools) is Linux-only; macOS has no SCTP support.
+  # librt (POSIX per-process timers, clock_gettime, shm_open) does not exist
+  # on macOS: clock_gettime/shm_open live in libc and timer_create is emulated.
+  if (NOT APPLE)
+    seastar_find_dep (lksctp-tools REQUIRED)
+    seastar_find_dep (rt REQUIRED)
+  endif ()
   seastar_find_dep (ucontext REQUIRED)
   seastar_find_dep (yaml-cpp REQUIRED
     VERSION 0.5.1)
